@@ -15,7 +15,6 @@
 import functools
 
 import jax
-import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -205,14 +204,13 @@ def inner_kernel(
             )
             op.start()
 
-        @jax.named_scope("process_decode_with_prefill_transition_all_async")
         def process_decode(b, store_inflight):
             # store_inflight: tuple (s0_inflight, s1_inflight) of int32 scalars.
             # s{n}_inflight == 1 iff slot n has an in-flight async store DMA.
             s0_inflight, s1_inflight = store_inflight
             is_valid = b < decode_count
             slot = b % 2
-            using_slot_0 = (slot == 0)
+            using_slot_0 = slot == 0
             cur_slot_inflight = jax.lax.select(using_slot_0, s0_inflight,
                                                s1_inflight)
 
@@ -504,8 +502,7 @@ def inner_kernel(
             a_raw_processed = a_raw_chunk[:, :n_v].T
             b_raw_processed = b_raw_chunk[:, :n_v].T
 
-            a_raw_processed = a_raw_processed.astype(jnp.float32)
-            b_raw_processed = b_raw_processed.astype(jnp.float32)
+            # Compute gates in VMEM in full fp32, not sure if needed.
             beta = jax.nn.sigmoid(b_raw_processed)
             g = -jnp.exp(a_log_ref[...][:, None].astype(
                 jnp.float32)) * jax.nn.softplus(a_raw_processed + dt_bias_ref[
@@ -531,16 +528,14 @@ def inner_kernel(
                 q = l2_normalize(q)
                 k = l2_normalize(k)
 
-            repeat_factor = n_v // n_kq
-            if repeat_factor > 1:
-                q = jnp.repeat(q, repeat_factor, axis=1)
-                k = jnp.repeat(k, repeat_factor, axis=1)
-
-            # TODO: eliminate these transposes by directly slicing in the right
-            # shape above,
             q = q.transpose(1, 0, 2)
             k = k.transpose(1, 0, 2)
             v = v.transpose(1, 0, 2)
+
+            repeat_factor = n_v // n_kq
+            if repeat_factor > 1:
+                q = jnp.repeat(q, repeat_factor, axis=0)
+                k = jnp.repeat(k, repeat_factor, axis=0)
 
             scale = d_k**-0.5
             q = q * scale
@@ -686,6 +681,7 @@ def inner_kernel(
 
             return None
 
+        @jax.named_scope("process_transition_prefill_optimized")
         def process_transition_prefill():
             # this is processing prefill sequences in a sublane that has multiple sequences
             C_trans = sublanesize
@@ -726,9 +722,9 @@ def inner_kernel(
             a_raw_processed = a_raw_chunk[:C_trans, :n_v].T
             b_raw_processed = b_raw_chunk[:C_trans, :n_v].T
 
-            a_raw_processed = a_raw_processed.astype(jnp.float32)
-            b_raw_processed = b_raw_processed.astype(jnp.float32)
+            # NOTE: b is upcasted to f32 in ref before sigmoid, beta is bf16
             beta_chunk = jax.nn.sigmoid(b_raw_processed)
+            # NOTE: a is upcasted to f32 before add to dt_bias
             g_chunk = -jnp.exp(a_log_ref[...][:, None].astype(
                 jnp.float32)) * jax.nn.softplus(a_raw_processed + dt_bias_ref[
                     ...][:, None].astype(jnp.float32))
@@ -766,9 +762,12 @@ def inner_kernel(
                 prefill_scratch[first_slot] = state_commit_scratch[0].astype(
                     prefill_scratch.dtype)
 
+            @pl.when((first_is_first > 0) & (first_has_init == 0))
+            def zero_first_state():
+                prefill_scratch[first_slot] = jnp.zeros(
+                    (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
+
             h = prefill_scratch[first_slot]
-            h = jnp.where((first_is_first > 0) & (first_has_init == 0),
-                          jnp.zeros_like(h), h)
 
             current_r = first_req_id
             sequence_valid = True
@@ -791,18 +790,14 @@ def inner_kernel(
                                            sequence_valid)
 
                 c_slot = current_r % 2
-
-                h0 = prefill_scratch[0]
-                h1 = prefill_scratch[1]
-                prefill_scratch[0] = jnp.where(c_slot == 0, h, h0)
-                prefill_scratch[1] = jnp.where(c_slot == 1, h, h1)
-
-                # prefill_scratch in f32, state_commit might be in bf16
-                state_commit_scratch[0] = prefill_scratch[c_slot].astype(
-                    state_commit_scratch.dtype)
+                prefill_scratch[c_slot] = h
 
                 def do_write():
+                    # Cast moved inside conditional (was unconditional in original).
+                    # h == prefill_scratch[c_slot] thanks to the write above.
                     # TODO: Make async
+                    state_commit_scratch[0] = h.astype(
+                        state_commit_scratch.dtype)
                     state_idx = state_indices[current_r][...]
                     copy_op = pltpu.make_async_copy(
                         src_ref=state_commit_scratch,
@@ -835,13 +830,16 @@ def inner_kernel(
                 should_load_t = (t_is_first > 0) & (t_has_init > 0)
                 jax.lax.cond(should_load_t, load_t_state, lambda: None)
 
-                h0_new = prefill_scratch[0]
-                h1_new = prefill_scratch[1]
-                new_h = jnp.where(t_slot == 0, h0_new, h1_new)
+                # Cold-start zero: write zeros into slot conditionally
+                # (replaces jnp.where(cond, zeros_like, ...) below).
+                # Mutually exclusive with should_load_t (t_has_init differs).
+                @pl.when((t_is_first > 0) & (t_has_init == 0))
+                def zero_t_state():
+                    prefill_scratch[t_slot] = jnp.zeros(
+                        (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
 
-                new_h = jnp.where((t_is_first > 0) & (t_has_init == 0),
-                                  jnp.zeros_like(new_h), new_h)
-                h = new_h
+                # Single dynamic-indexed read replaces 2 reads + jnp.where.
+                h = prefill_scratch[t_slot]
 
                 current_r = t_req
 
@@ -878,14 +876,15 @@ def inner_kernel(
 
             final_slot = current_r % 2
             prefill_scratch[final_slot] = h
-            state_commit_scratch[0] = h.astype(state_commit_scratch.dtype)
 
             is_current_r_prefill = current_r >= decode_tokens
 
             # Store state if the current request is a prefill
             @pl.when(is_current_r_prefill)
             def do_final_write():
+                # Cast moved inside conditional (was unconditional in original).
                 # TODO: make async
+                state_commit_scratch[0] = h.astype(state_commit_scratch.dtype)
                 state_idx = state_indices[current_r][...]
                 copy_op = pltpu.make_async_copy(
                     src_ref=state_commit_scratch,
@@ -895,8 +894,6 @@ def inner_kernel(
                 copy_op.start()
                 copy_op.wait()
                 return None
-
-            return None
 
         is_transition = schedule_table[step, 10][...]
 
@@ -1146,7 +1143,9 @@ def fused_kernel(
             output_ref,
             output_ref,
             scratches=[
-                schedule_table_ref, state_indices_ref, has_initial_state_ref
+                schedule_table_ref,
+                state_indices_ref,
+                has_initial_state_ref,
             ],
         )
 
@@ -1182,6 +1181,7 @@ def fused_kernel(
         "chunk_size",
         "BT",
         "use_qk_norm_in_gdn",
+        "race_detect_enable",
     ],
 )
 def recurrent_scan(
@@ -1203,6 +1203,7 @@ def recurrent_scan(
     BT: int = 128,
     use_qk_norm_in_gdn: bool = True,
     has_initial_state: jax.Array | None = None,
+    race_detect_enable: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused recurrent scan kernel for GDN on TPU v7.
 
@@ -1314,6 +1315,8 @@ def recurrent_scan(
         grid_spec=grid_spec,
         input_output_aliases={1: 0},
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        interpret=pltpu.InterpretParams(
+            detect_races=True) if race_detect_enable else False,
     )(
         mixed_qkv,
         recurrent_state,
