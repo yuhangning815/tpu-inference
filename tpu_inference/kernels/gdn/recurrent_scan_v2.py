@@ -121,11 +121,15 @@ def inner_kernel(
     # VMEM scratchpad: (2, n_v, d_k, d_v). To carry state across chunks
     # (double buffered)
     prefill_scratch,
-    # VMEM scratchpad: (1, 2, n_v, d_k, d_v). TODO: double
-    # buffer or x buffer to to loop over BT in decode without overwriting state and using async copy for state load/store)
+    # VMEM scratchpad: (1, n_v, d_k, d_v). Per-iter safe-copy of the loaded
+    # state. Required as a separate buffer from decode_load_scratch because
+    # the prefetch DMA for iter b+2 writes to the same slot concurrently with
+    # this iter's compute; this buffer isolates the reads. Stored as bf16;
+    # per-head fp32 cast happens in VREG inside the compute loop.
     decode_state_scratch,
-    # VMEM scratchpad: (1, n_v, d_k, d_v). dtype = recurrent_state dtype
-    # TODO: if output dtype of state is always f32 then this can be removed.
+    # VMEM scratchpad: (1, n_v, d_k, d_v). Aliased to slot 0 of
+    # decode_store_scratch in _run_with_scratch (decode drains its stores
+    # before prefill runs, so the slot is free for prefill bf16 staging).
     state_commit_scratch,
     # VMEM scratchpad: (2, n_v, d_k, d_v). Double-buffered staging for
     # fully-async decode loads. iter b lands in slot (b % 2).
@@ -205,7 +209,6 @@ def inner_kernel(
             )
             op.start()
 
-        @jax.named_scope("process_decode_with_prefill_transition_all_async")
         def process_decode(b, store_inflight):
             # store_inflight: tuple (s0_inflight, s1_inflight) of int32 scalars.
             # s{n}_inflight == 1 iff slot n has an in-flight async store DMA.
@@ -214,7 +217,7 @@ def inner_kernel(
             slot = b % 2
             using_slot_0 = (slot == 0)
             cur_slot_inflight = jax.lax.select(using_slot_0, s0_inflight,
-                                               s1_inflight)
+                                                s1_inflight)
 
             @pl.when(is_valid)
             def do_work():
@@ -226,9 +229,11 @@ def inner_kernel(
                 )
                 wait_load.wait()
 
-                # Copy loaded state to fp32 compute scratch.
-                decode_state_scratch[pl.ds(0, 1)] = decode_load_scratch[pl.ds(
-                    slot, 1)][...].astype(jnp.float32)
+                # Safe-copy of loaded state. Isolates compute from the
+                # prefetch DMA below that writes the same slot of
+                # decode_load_scratch concurrently. bf16 -> bf16, no cast.
+                decode_state_scratch[pl.ds(
+                    0, 1)] = decode_load_scratch[pl.ds(slot, 1)][...]
 
                 # Prefetch load for iter b+2 (same slot, since (b+2) % 2 == b % 2).
                 # This DMA overlaps with the compute below.
@@ -314,7 +319,8 @@ def inner_kernel(
                     k_h = k[h:h + 1, :]  # (1, d_k)
                     v_h = v[h:h + 1, :]  # (1, d_v)
 
-                    state_h = current_state[h]  # (d_k, d_v)
+                    state_h = current_state[h].astype(
+                        jnp.float32)  # (d_k, d_v)
 
                     k_state_h = pl.dot(
                         k_h, state_h,
@@ -363,9 +369,6 @@ def inner_kernel(
                 new_state = jnp.stack(new_state_list,
                                       axis=0)  # (n_v, d_k, d_v)
 
-                decode_state_scratch[pl.ds(
-                    0, 1)] = new_state[None, ...].astype(current_state.dtype)
-
                 # Accumulate output in scratchpad
                 current_output = decode_output_scratch[...]
                 mask = (jnp.arange(BT) == b).astype(current_output.dtype)[:,
@@ -383,14 +386,14 @@ def inner_kernel(
                 # so we don't clobber a buffer that's still being read.
                 @pl.when(cur_slot_inflight > 0)
                 def _wait_same_slot_store():
-                    temp_desc = pltpu.make_async_copy(
+                    dummy = pltpu.make_async_copy(
                         src_ref=decode_store_scratch.at[pl.ds(slot, 1)],
                         dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                         sem=decode_write_semaphore.at[slot],
                     )
-                    temp_desc.wait()
+                    dummy.wait()
 
-                decode_store_scratch[slot] = decode_state_scratch[0].astype(
+                decode_store_scratch[slot] = new_state.astype(
                     decode_store_scratch.dtype)
                 copy_op = pltpu.make_async_copy(
                     src_ref=decode_store_scratch.at[pl.ds(slot, 1)],
@@ -416,30 +419,28 @@ def inner_kernel(
 
         # loop over bt, could be for loop, BT is static anyway, unroll
         final_s0_inflight, final_s1_inflight = jax.lax.fori_loop(
-            0,
-            BT,
-            process_decode,
+            0, BT, process_decode,
             (jnp.int32(0), jnp.int32(0)),
         )
 
         # Drain any remaining async store DMAs (at most one per slot).
         @pl.when(final_s0_inflight > 0)
         def _drain_slot_0():
-            temp_desc = pltpu.make_async_copy(
+            dummy = pltpu.make_async_copy(
                 src_ref=decode_store_scratch.at[pl.ds(0, 1)],
                 dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                 sem=decode_write_semaphore.at[0],
             )
-            temp_desc.wait()
+            dummy.wait()
 
         @pl.when(final_s1_inflight > 0)
         def _drain_slot_1():
-            temp_desc = pltpu.make_async_copy(
+            dummy = pltpu.make_async_copy(
                 src_ref=decode_store_scratch.at[pl.ds(1, 1)],
                 dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                 sem=decode_write_semaphore.at[1],
             )
-            temp_desc.wait()
+            dummy.wait()
 
         # Mask and write accumulated outputs to HBM
         mask = (jnp.arange(BT)
@@ -482,6 +483,7 @@ def inner_kernel(
                 prefill_scratch[prefill_slot] = jnp.zeros(
                     (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
 
+
             ### Preparataion for chunk wise math,
             ### this kernel design could be optimized lot by not doing this every chunk
             # 1. Extract Q, K, V, g, beta for the chunk
@@ -504,8 +506,7 @@ def inner_kernel(
             a_raw_processed = a_raw_chunk[:, :n_v].T
             b_raw_processed = b_raw_chunk[:, :n_v].T
 
-            a_raw_processed = a_raw_processed.astype(jnp.float32)
-            b_raw_processed = b_raw_processed.astype(jnp.float32)
+            # Compute gates in VMEM in full fp32, not sure if needed.
             beta = jax.nn.sigmoid(b_raw_processed)
             g = -jnp.exp(a_log_ref[...][:, None].astype(
                 jnp.float32)) * jax.nn.softplus(a_raw_processed + dt_bias_ref[
@@ -607,12 +608,12 @@ def inner_kernel(
             # Finish async init load before consuming prefill_scratch[prefill_slot].
             @pl.when(should_load_init)
             def _finish_init_load():
-                temp_desc = pltpu.make_async_copy(
+                dummy = pltpu.make_async_copy(
                     src_ref=recurrent_state_in.at[pl.ds(init_state_idx, 1)],
                     dst_ref=state_commit_scratch,
                     sem=prefill_semaphore.at[prefill_slot],
                 )
-                temp_desc.wait()
+                dummy.wait()
                 prefill_scratch[prefill_slot] = state_commit_scratch[0].astype(
                     prefill_scratch.dtype)
 
@@ -677,12 +678,12 @@ def inner_kernel(
             # Drain async final store (started in store_state above).
             @pl.when(is_last_chunk > 0)
             def _finish_store_state():
-                temp_desc = pltpu.make_async_copy(
+                dummy = pltpu.make_async_copy(
                     src_ref=state_commit_scratch,
                     dst_ref=recurrent_state_out.at[pl.ds(store_state_idx, 1)],
                     sem=prefill_semaphore.at[prefill_slot],
                 )
-                temp_desc.wait()
+                dummy.wait()
 
             return None
 
@@ -726,9 +727,9 @@ def inner_kernel(
             a_raw_processed = a_raw_chunk[:C_trans, :n_v].T
             b_raw_processed = b_raw_chunk[:C_trans, :n_v].T
 
-            a_raw_processed = a_raw_processed.astype(jnp.float32)
-            b_raw_processed = b_raw_processed.astype(jnp.float32)
+            # NOTE: b is upcasted to f32 in ref before sigmoid, beta is bf16
             beta_chunk = jax.nn.sigmoid(b_raw_processed)
+            # NOTE: a is upcasted to f32 before add to dt_bias
             g_chunk = -jnp.exp(a_log_ref[...][:, None].astype(
                 jnp.float32)) * jax.nn.softplus(a_raw_processed + dt_bias_ref[
                     ...][:, None].astype(jnp.float32))
@@ -757,12 +758,12 @@ def inner_kernel(
             # Finish async initial load before consuming prefill_scratch[first_slot].
             @pl.when(should_load_first)
             def _finish_first_load():
-                temp_desc = pltpu.make_async_copy(
+                dummy = pltpu.make_async_copy(
                     src_ref=recurrent_state_in.at[pl.ds(first_state_idx, 1)],
                     dst_ref=state_commit_scratch,
                     sem=prefill_semaphore.at[first_slot],
                 )
-                temp_desc.wait()
+                dummy.wait()
                 prefill_scratch[first_slot] = state_commit_scratch[0].astype(
                     prefill_scratch.dtype)
 
@@ -1096,7 +1097,6 @@ def fused_kernel(
     def _run_with_scratch(
         scratch_ref,
         decode_state_scratch_ref,
-        state_commit_scratch_ref,
         decode_load_scratch_ref,
         decode_store_scratch_ref,
         decode_output_scratch_ref,
@@ -1104,6 +1104,10 @@ def fused_kernel(
         decode_write_sem,
         prefill_sem,
     ):
+        # Alias state_commit_scratch to slot 0 of decode_store_scratch.
+        # Decode drains its store DMAs before prefill runs in any step, so
+        # the slot is free to use as prefill's bf16 HBM staging.
+        state_commit_scratch_ref = decode_store_scratch_ref.at[pl.ds(0, 1)]
 
         pipeline_func = pltpu.emit_pipeline(
             body=functools.partial(
@@ -1155,19 +1159,18 @@ def fused_kernel(
         _run_with_scratch,
         pltpu.VMEM((2, n_v, d_k, d_v),
                    jnp.float32),  # prefill_scratch (double buffered)
-        pltpu.VMEM((1, n_v, d_k, d_v), jnp.float32),  # decode_state_scratch
         pltpu.VMEM((1, n_v, d_k, d_v),
-                   recurrent_state_ref.dtype),  # state_commit_scratch
-        pltpu.VMEM((2, n_v, d_k, d_v), recurrent_state_ref.dtype
-                   ),  # decode_load_scratch (double-buffered)
-        pltpu.VMEM((2, n_v, d_k, d_v), recurrent_state_ref.dtype
-                   ),  # decode_store_scratch (double-buffered)
+                   recurrent_state_ref.dtype),  # decode_state_scratch
+        # state_commit_scratch aliased to slot 0 of decode_store_scratch in
+        # _run_with_scratch; no separate allocation.
+        pltpu.VMEM((2, n_v, d_k, d_v),
+                   recurrent_state_ref.dtype),  # decode_load_scratch (double-buffered)
+        pltpu.VMEM((2, n_v, d_k, d_v),
+                   recurrent_state_ref.dtype),  # decode_store_scratch (double-buffered; slot 0 also used as prefill's state_commit staging)
         pltpu.VMEM((BT, n_v * d_v),
                    mixed_qkv_ref.dtype),  # decode_output_scratch
-        pltpu.SemaphoreType.DMA(
-            (2, )),  # decode_read_semaphores (one per slot)
-        pltpu.SemaphoreType.DMA(
-            (2, )),  # decode_write_semaphore (one per slot)
+        pltpu.SemaphoreType.DMA((2, )),  # decode_read_semaphores (one per slot)
+        pltpu.SemaphoreType.DMA((2, )),  # decode_write_semaphore (one per slot)
         pltpu.SemaphoreType.DMA((2, )),  # prefill_semaphore
     )
 
