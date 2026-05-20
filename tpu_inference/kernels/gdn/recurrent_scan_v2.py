@@ -1291,7 +1291,7 @@ def recurrent_scan(
         ),
         grid_spec=grid_spec,
         input_output_aliases={1: 0},
-        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, vmem_limit_bytes=34 * 1024 * 1024),
     )(
         mixed_qkv,
         recurrent_state,
