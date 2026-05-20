@@ -15,13 +15,43 @@
 import functools
 
 import jax
-import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 
 from tpu_inference.kernels.gdn import \
     compute_schedule_v2 as compute_schedule_table_v2
 
+
+
+# This is actually slower in the fused kernel. But it's faster in unit tests. likely it's due to VPU pressure.
+# def invert_triangular_matrix(A, block_size=None):
+#   """Inverts a unit lower triangular matrix A using Neumann doubling.
+
+#   Algorithm: Neumann doubling. For L strictly lower triangular of size N x N,
+#   since L^N = 0 we have:
+#     (I + L)^{-1} = (I - L)(I + L^2)(I + L^4) ... (I + L^(N/2))
+
+#   Args:
+#     A: Unit lower triangular matrix of shape (B, N, N).
+#     block_size: Size of the blocks for Gaussian elimination (unused).
+
+#   Returns:
+#     Inverse of A, of shape (B, N, N).
+
+#   For N=128 this is exactly 6 iterations = 12 matmuls, all (B, 128, 128).
+#   """
+#   B, N, _ = A.shape
+#   num_iters = max(1, (N - 1).bit_length() - 1)
+#   in_dtype = A.dtype
+#   A_f32 = A.astype(jnp.float32)
+#   L = jnp.tril(A_f32, k=-1)
+#   eye = jnp.broadcast_to(jnp.eye(N, dtype=jnp.float32), (B, N, N))
+#   Y = eye - L
+#   for _ in range(num_iters):
+#     L = jnp.matmul(L, L, precision=jax.lax.Precision.HIGHEST)
+#     Y = Y + jnp.matmul(Y, L, precision=jax.lax.Precision.HIGHEST)
+#   return Y.astype(in_dtype)
 
 def invert_triangular_matrix(A, block_size=16):
     """Inverts a unit lower triangular matrix A block-wise.
@@ -386,12 +416,12 @@ def inner_kernel(
                 # so we don't clobber a buffer that's still being read.
                 @pl.when(cur_slot_inflight > 0)
                 def _wait_same_slot_store():
-                    dummy = pltpu.make_async_copy(
+                    temp_desc = pltpu.make_async_copy(
                         src_ref=decode_store_scratch.at[pl.ds(slot, 1)],
                         dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                         sem=decode_write_semaphore.at[slot],
                     )
-                    dummy.wait()
+                    temp_desc.wait()
 
                 decode_store_scratch[slot] = new_state.astype(
                     decode_store_scratch.dtype)
@@ -428,21 +458,21 @@ def inner_kernel(
         # Drain any remaining async store DMAs (at most one per slot).
         @pl.when(final_s0_inflight > 0)
         def _drain_slot_0():
-            dummy = pltpu.make_async_copy(
+            temp_desc = pltpu.make_async_copy(
                 src_ref=decode_store_scratch.at[pl.ds(0, 1)],
                 dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                 sem=decode_write_semaphore.at[0],
             )
-            dummy.wait()
+            temp_desc.wait()
 
         @pl.when(final_s1_inflight > 0)
         def _drain_slot_1():
-            dummy = pltpu.make_async_copy(
+            temp_desc = pltpu.make_async_copy(
                 src_ref=decode_store_scratch.at[pl.ds(1, 1)],
                 dst_ref=recurrent_state_out.at[pl.ds(0, 1)],
                 sem=decode_write_semaphore.at[1],
             )
-            dummy.wait()
+            temp_desc.wait()
 
         # Mask and write accumulated outputs to HBM
         mask = (jnp.arange(BT)
@@ -468,18 +498,14 @@ def inner_kernel(
             should_load_init = (is_first_chunk > 0) & (init_has_init > 0)
             should_zero_init = (is_first_chunk > 0) & (init_has_init == 0)
 
-            # Sync init load: load from HBM and copy into prefill_scratch.
             @pl.when(should_load_init)
-            def _do_init_load():
+            def _start_init_load():
                 copy_op = pltpu.make_async_copy(
                     src_ref=recurrent_state_in.at[pl.ds(init_state_idx, 1)],
                     dst_ref=state_commit_scratch,
                     sem=prefill_semaphore.at[prefill_slot],
                 )
                 copy_op.start()
-                copy_op.wait()
-                prefill_scratch[prefill_slot] = state_commit_scratch[0].astype(
-                    prefill_scratch.dtype)
 
             @pl.when(should_zero_init)
             def _zero_init_state():
@@ -558,14 +584,14 @@ def inner_kernel(
             g_cumsum = jnp.stack(g_cumsum_list, axis=-1)
             k_beta = k * beta[..., None]
 
-            # Fuse S and S_q into a single matmul. 
+            # Fuse S and S_q into a single matmul.
             k_T = k.transpose(0, 2, 1)
             kbeta_q = jnp.concatenate([k_beta, q], axis=1)  # (n_v, 2C, d_k)
             S_both = jnp.matmul(
                 kbeta_q.astype(jnp.float32),
                 k_T.astype(jnp.float32),
                 precision=jax.lax.Precision.HIGHEST,
-            )  
+            )  # (n_v, 2C, C)
             S = S_both[:, :C, :]
             S_q = S_both[:, C:, :]
 
@@ -593,7 +619,9 @@ def inner_kernel(
             # TODO: call the function in kernels file
             A_inv = invert_triangular_matrix(I_plus_S, block_size=16)
 
-            # Fuse u and w into a single matmul.
+            # Fuse u and w into a single matmul. Both compute
+            # A_inv @ <something>; stack v_beta and k_beta_g along the last
+            # axis (d_v -> d_v + d_k), do one matmul, then split.
             v_beta = v * beta[..., None]
             k_beta_g = k_beta * jnp.exp(g_cumsum)[..., None]
             vk_in = jnp.concatenate(
@@ -609,7 +637,18 @@ def inner_kernel(
 
             q_g = q * jnp.exp(g_cumsum)[..., None]
 
-            # Fuse attn_inter and v_prime into a single matmul. 
+            # Fuse attn_inter and v_prime into a single matmul. With attentionDP, the async copy leads to very small perf gain.
+            @pl.when(should_load_init)
+            def _finish_init_load():
+                temp_desc = pltpu.make_async_copy(
+                    src_ref=recurrent_state_in.at[pl.ds(init_state_idx, 1)],
+                    dst_ref=state_commit_scratch,
+                    sem=prefill_semaphore.at[prefill_slot],
+                )
+                temp_desc.wait()
+                prefill_scratch[prefill_slot] = state_commit_scratch[0].astype(
+                    prefill_scratch.dtype)
+
             current_state = prefill_scratch[prefill_slot]
             qw = jnp.concatenate([q_g.astype(jnp.float32), w], axis=1)
             comb = jnp.matmul(
@@ -679,18 +718,15 @@ def inner_kernel(
             should_load_first = (first_is_first > 0) & (first_has_init > 0)
             first_state_idx = state_indices[first_req_id][...]
 
-            # Sync initial load: load from HBM and copy into prefill_scratch.
+            # Async initial load
             @pl.when(should_load_first)
-            def _do_first_load():
+            def _start_first_load():
                 copy_op = pltpu.make_async_copy(
                     src_ref=recurrent_state_in.at[pl.ds(first_state_idx, 1)],
                     dst_ref=state_commit_scratch,
                     sem=prefill_semaphore.at[first_slot],
                 )
                 copy_op.start()
-                copy_op.wait()
-                prefill_scratch[first_slot] = state_commit_scratch[0].astype(
-                    prefill_scratch.dtype)
 
             # Workaround: Upcast to fp32 to avoid NaNs
             qkv_chunk = prefill_qkv_ref[:C_trans, :].astype(jnp.float32)
@@ -742,6 +778,18 @@ def inner_kernel(
             def _zero_first_slot():
                 prefill_scratch[first_slot] = jnp.zeros(
                     (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
+
+            # Finish the async initial load started above
+            @pl.when(should_load_first)
+            def _finish_first_load():
+                temp_desc = pltpu.make_async_copy(
+                    src_ref=recurrent_state_in.at[pl.ds(first_state_idx, 1)],
+                    dst_ref=state_commit_scratch,
+                    sem=prefill_semaphore.at[first_slot],
+                )
+                temp_desc.wait()
+                prefill_scratch[first_slot] = state_commit_scratch[0].astype(
+                    prefill_scratch.dtype)
 
             h = prefill_scratch[first_slot]
 
@@ -853,6 +901,7 @@ def inner_kernel(
             is_current_r_prefill = current_r >= decode_tokens
 
             # Store state if the current request is a prefill.
+            # At the end of the transition prefill. No need to make this async.
             @pl.when(is_current_r_prefill)
             def do_final_write():
                 state_idx = state_indices[current_r][...]
@@ -1160,6 +1209,8 @@ def fused_kernel(
         "chunk_size",
         "BT",
         "use_qk_norm_in_gdn",
+        "vmem_limit_bytes",
+        "race_detect_enable",
     ],
 )
 def recurrent_scan(
@@ -1181,6 +1232,8 @@ def recurrent_scan(
     BT: int = 128,
     use_qk_norm_in_gdn: bool = True,
     has_initial_state: jax.Array | None = None,
+    vmem_limit_bytes: int | None = None,
+    race_detect_enable: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused recurrent scan kernel for GDN on TPU v7.
 
@@ -1206,6 +1259,9 @@ def recurrent_scan(
     chunk_size: Block size for processing (default 128).
     BT: Block size for decode requests (default 128).
     use_qk_norm_in_gdn: Whether to use QK normalization.
+    vmem_limit_bytes: Per-kernel scoped VMEM ceiling passed to Mosaic.
+    race_detect_enable: If True, run the kernel under Pallas interpret mode with
+      DMA/buffer race detection enabled.
 
   Returns:
     A tuple containing:
@@ -1220,6 +1276,10 @@ def recurrent_scan(
     num_tokens = mixed_qkv.shape[0]
     tpu_info = pltpu.get_tpu_info()
     sublanesize = 4 // mixed_qkv.itemsize * tpu_info.num_sublanes
+
+    # Default the scoped VMEM ceiling
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.8)
 
     # Pad token dimension so invalid pipeline steps DMA into a safe sink area.
     # Sink offset must be aligned to sublanesize for Mosaic tile compatibility.
@@ -1291,7 +1351,12 @@ def recurrent_scan(
         ),
         grid_spec=grid_spec,
         input_output_aliases={1: 0},
-        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, vmem_limit_bytes=34 * 1024 * 1024),
+        interpret=(pltpu.InterpretParams(
+            detect_races=True) if race_detect_enable else False),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem_limit_bytes,
+        ),
     )(
         mixed_qkv,
         recurrent_state,
