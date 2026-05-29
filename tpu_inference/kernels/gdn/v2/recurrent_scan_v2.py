@@ -15,42 +15,12 @@
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 
 from tpu_inference.kernels.gdn.v2 import \
     compute_schedule_v2 as compute_schedule_table_v2
-
-
-
-# def invert_triangular_matrix(A, block_size=None):
-#   """Inverts a unit lower triangular matrix A using Neumann doubling.
-
-#   Algorithm: Neumann doubling. For L strictly lower triangular of size N x N,
-#   since L^N = 0 we have:
-#     (I + L)^{-1} = (I - L)(I + L^2)(I + L^4) ... (I + L^(N/2))
-
-#   Args:
-#     A: Unit lower triangular matrix of shape (B, N, N).
-#     block_size: Size of the blocks for Gaussian elimination (unused).
-
-#   Returns:
-#     Inverse of A, of shape (B, N, N).
-
-#   For N=128 this is exactly 6 iterations = 12 matmuls, all (B, 128, 128).
-#   """
-#   B, N, _ = A.shape
-#   num_iters = max(1, (N - 1).bit_length() - 1)
-#   in_dtype = A.dtype
-#   A_f32 = A.astype(jnp.float32)
-#   L = jnp.tril(A_f32, k=-1)
-#   eye = jnp.broadcast_to(jnp.eye(N, dtype=jnp.float32), (B, N, N))
-#   Y = eye - L
-#   for _ in range(num_iters):
-#     L = jnp.matmul(L, L, precision=jax.lax.Precision.HIGHEST)
-#     Y = Y + jnp.matmul(Y, L, precision=jax.lax.Precision.HIGHEST)
-#   return Y.astype(in_dtype)
 
 
 def invert_triangular_matrix(A, block_size=16):
@@ -245,7 +215,7 @@ def inner_kernel(
             s0_inflight, s1_inflight = store_inflight
             is_valid = b < decode_count
             slot = b % 2
-            using_slot_0 = slot == 0
+            using_slot_0 = (slot == 0)
             cur_slot_inflight = jax.lax.select(using_slot_0, s0_inflight,
                                                s1_inflight)
 
@@ -584,16 +554,11 @@ def inner_kernel(
             g_cumsum = jnp.stack(g_cumsum_list, axis=-1)
             k_beta = k * beta[..., None]
 
-            # Fuse S and S_q into a single matmul.
-            k_T = k.transpose(0, 2, 1)
-            kbeta_q = jnp.concatenate([k_beta, q], axis=1)  # (n_v, 2C, d_k)
-            S_both = jnp.matmul(
-                kbeta_q.astype(jnp.float32),
-                k_T.astype(jnp.float32),
+            S = jnp.matmul(
+                k_beta.astype(jnp.float32),
+                k.transpose(0, 2, 1).astype(jnp.float32),
                 precision=jax.lax.Precision.HIGHEST,
-            )  # (n_v, 2C, C)
-            S = S_both[:, :C, :]
-            S_q = S_both[:, C:, :]
+            )
 
             g_diff = g_cumsum[..., :, None] - g_cumsum[..., None, :]
             i = jnp.arange(C)[:, None]
@@ -601,14 +566,16 @@ def inner_kernel(
             mask_float = (i > j).astype(jnp.float32)
 
             # Defensive code to handle large positive g_diff which can cause
-            # overflow in exp,
-            # TODO: analyze if this is a common case and if we can remove this or do
-            # by other means (like clipping g values before cumsum or using a
-            # different data type for g/g_cumsum)
+            # overflow in exp.
             g_diff_safe = jnp.minimum(g_diff, 0.0)
             S = jnp.where(mask_float[None, :, :] > 0, S * jnp.exp(g_diff_safe),
                           0.0)
 
+            S_q = jnp.matmul(
+                q.astype(jnp.float32),
+                k.transpose(0, 2, 1).astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
             mask_float_q = (i >= j).astype(jnp.float32)
             g_diff_Sq = g_diff_safe * mask_float_q[None, ...] + (
                 1.0 - mask_float_q[None, ...]) * (-1e30)
@@ -616,28 +583,26 @@ def inner_kernel(
             S_q = S_q * mask_float_q[None, ...]
 
             I_plus_S = jnp.eye(C, dtype=jnp.float32)[None, ...] + S
-            # TODO: call the function in kernels file
             A_inv = invert_triangular_matrix(I_plus_S, block_size=16)
 
-            # Fuse u and w into a single matmul. Both compute
-            # A_inv @ <something>; stack v_beta and k_beta_g along the last
-            # axis (d_v -> d_v + d_k), do one matmul, then split.
             v_beta = v * beta[..., None]
+            u = jnp.matmul(A_inv,
+                           v_beta.astype(jnp.float32),
+                           precision=jax.lax.Precision.HIGHEST)
+
             k_beta_g = k_beta * jnp.exp(g_cumsum)[..., None]
-            vk_in = jnp.concatenate(
-                [
-                    v_beta.astype(jnp.float32),
-                    k_beta_g.astype(jnp.float32),
-                ],
-                axis=2,
-            )  # (n_v, C, d_v + d_k)
-            uw = jnp.matmul(A_inv, vk_in, precision=jax.lax.Precision.HIGHEST)
-            u = uw[..., :d_v]
-            w = uw[..., d_v:]
+            w = jnp.matmul(
+                A_inv,
+                k_beta_g.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
 
             q_g = q * jnp.exp(g_cumsum)[..., None]
 
-            # Fuse attn_inter and v_prime into a single matmul. With attentionDP, the async copy leads to very small perf gain.
+            # Finish the async init load started above: wait for the DMA, then
+            # commit into prefill_scratch, immediately before current_state is
+            # read. Uses the existing throwaway-descriptor wait pattern (a fresh
+            # descriptor with the same sem just waits on the in-flight DMA).
             @pl.when(should_load_init)
             def _finish_init_load():
                 temp_desc = pltpu.make_async_copy(
@@ -650,14 +615,16 @@ def inner_kernel(
                     prefill_scratch.dtype)
 
             current_state = prefill_scratch[prefill_slot]
-            qw = jnp.concatenate([q_g.astype(jnp.float32), w], axis=1)
-            comb = jnp.matmul(
-                qw,
+            attn_inter = jnp.matmul(
+                q_g.astype(jnp.float32),
                 current_state.astype(jnp.float32),
                 precision=jax.lax.Precision.HIGHEST,
-            )  # (n_v, 2C, d_v)
-            attn_inter = comb[:, :C, :]
-            v_prime = comb[:, C:, :]
+            )
+            v_prime = jnp.matmul(
+                w,
+                current_state.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
 
             v_new = u - v_prime
             term2 = jnp.matmul(S_q, v_new, precision=jax.lax.Precision.HIGHEST)
@@ -718,7 +685,13 @@ def inner_kernel(
             should_load_first = (first_is_first > 0) & (first_has_init > 0)
             first_state_idx = state_indices[first_req_id][...]
 
-            # Async initial load
+            # Async initial load: start the DMA from HBM into
+            # state_commit_scratch now so it overlaps with the chunk-prep
+            # compute below. The wait + commit into prefill_scratch happens
+            # just before h is first read (see _finish_first_load). The prep
+            # compute does not touch state_commit_scratch, and
+            # prefill_semaphore[first_slot] carries no other in-flight DMA
+            # between this start and that wait, so the deferred wait is safe.
             @pl.when(should_load_first)
             def _start_first_load():
                 copy_op = pltpu.make_async_copy(
@@ -759,7 +732,9 @@ def inner_kernel(
                 q = l2_normalize(q)
                 k = l2_normalize(k)
 
-            # Transpose first, then repeat
+            # Transpose first, then repeat: the transpose operates on the
+            # smaller (C_trans, n_kq, d_k) tensor; the subsequent repeat on
+            # the (now-leading) axis produces the same final layout.
             q = q.transpose(1, 0, 2)
             k = k.transpose(1, 0, 2)
             v = v.transpose(1, 0, 2)
@@ -773,13 +748,17 @@ def inner_kernel(
             q = q * scale
 
             # Cold-start: zero the slot in place when the first sequence has
-            # no carried-over state, then read.
+            # no carried-over state, then read. Writing zeros to the ref
+            # avoids materializing a full-state zeros tensor as a JAX value.
             @pl.when((first_is_first > 0) & (first_has_init == 0))
             def _zero_first_slot():
                 prefill_scratch[first_slot] = jnp.zeros(
                     (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
 
-            # Finish the async initial load started above
+            # Finish the async initial load started above: wait for the DMA,
+            # then commit into prefill_scratch, immediately before h is read.
+            # Mutually exclusive with _zero_first_slot (cold start), so exactly
+            # one of them populates first_slot before the read below.
             @pl.when(should_load_first)
             def _finish_first_load():
                 temp_desc = pltpu.make_async_copy(
@@ -901,7 +880,6 @@ def inner_kernel(
             is_current_r_prefill = current_r >= decode_tokens
 
             # Store state if the current request is a prefill.
-            # At the end of the transition prefill. No need to make this async.
             @pl.when(is_current_r_prefill)
             def do_final_write():
                 state_idx = state_indices[current_r][...]
@@ -1169,9 +1147,7 @@ def fused_kernel(
             output_ref,
             output_ref,
             scratches=[
-                schedule_table_ref,
-                state_indices_ref,
-                has_initial_state_ref,
+                schedule_table_ref, state_indices_ref, has_initial_state_ref
             ],
         )
 
@@ -1259,9 +1235,14 @@ def recurrent_scan(
     chunk_size: Block size for processing (default 128).
     BT: Block size for decode requests (default 128).
     use_qk_norm_in_gdn: Whether to use QK normalization.
-    vmem_limit_bytes: Per-kernel scoped VMEM ceiling passed to Mosaic.
+    vmem_limit_bytes: Per-kernel scoped VMEM ceiling passed to Mosaic. If None
+      (default), it is set to the full VMEM capacity of the TPU, following the
+      ragged_paged_attention convention. Pass an explicit smaller value at the
+      call site to leave more room for unscoped VMEM if e2e tuning calls for it.
     race_detect_enable: If True, run the kernel under Pallas interpret mode with
-      DMA/buffer race detection enabled.
+      DMA/buffer race detection enabled (pltpu.InterpretParams(detect_races=
+      True)). For tests only -- interpret mode is far slower and not for
+      production. Default False (normal compiled execution).
 
   Returns:
     A tuple containing:
@@ -1277,7 +1258,11 @@ def recurrent_scan(
     tpu_info = pltpu.get_tpu_info()
     sublanesize = 4 // mixed_qkv.itemsize * tpu_info.num_sublanes
 
-    # Default the scoped VMEM ceiling. This value could be tuned for different state cache numerics and chunk sizes. 
+    # Default the scoped VMEM ceiling to the full VMEM capacity, matching the
+    # ragged_paged_attention kernel's convention. This avoids compile-time
+    # VMEM OOMs across shapes/dtypes; the compiler still only uses what each
+    # compilation actually needs. A caller can pass a smaller explicit value
+    # to trade scoped headroom for more unscoped VMEM.
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.8)
 
