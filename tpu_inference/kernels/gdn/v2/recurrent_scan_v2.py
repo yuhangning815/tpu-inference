@@ -654,15 +654,15 @@ def inner_kernel(
                 q = l2_normalize(q)
                 k = l2_normalize(k)
 
-            # Transpose first, then repeat
+            repeat_factor = n_v // n_kq
+            if repeat_factor > 1:
+                q = jnp.repeat(q, repeat_factor, axis=1)
+                k = jnp.repeat(k, repeat_factor, axis=1)
+
+            # TODO: eliminate these transposes by directly slicing in the right shape above,
             q = q.transpose(1, 0, 2)
             k = k.transpose(1, 0, 2)
             v = v.transpose(1, 0, 2)
-
-            repeat_factor = n_v // n_kq
-            if repeat_factor > 1:
-                q = jnp.repeat(q, repeat_factor, axis=0)
-                k = jnp.repeat(k, repeat_factor, axis=0)
 
             scale = d_k**-0.5
             q = q * scale
@@ -710,15 +710,18 @@ def inner_kernel(
 
                 c_slot = current_r % 2
 
-                # Commit the previous iter's h to the current request's slot.
-                # The other slot is untouched.
-                prefill_scratch[c_slot] = h
+                h0 = prefill_scratch[0]
+                h1 = prefill_scratch[1]
+                prefill_scratch[0] = jnp.where(c_slot == 0, h, h0)
+                prefill_scratch[1] = jnp.where(c_slot == 1, h, h1)
+
+                # prefill_scratch in f32, state_commit might be in bf16
+                state_commit_scratch[0] = prefill_scratch[c_slot].astype(
+                    state_commit_scratch.dtype)
 
                 def do_write():
+                    # TODO: Make async
                     state_idx = state_indices[current_r][...]
-                    # Stage h only when we actually DMA out.
-                    state_commit_scratch[0] = h.astype(
-                        state_commit_scratch.dtype)
                     copy_op = pltpu.make_async_copy(
                         src_ref=state_commit_scratch,
                         dst_ref=recurrent_state_out.at[pl.ds(state_idx, 1)],
@@ -750,14 +753,13 @@ def inner_kernel(
                 should_load_t = (t_is_first > 0) & (t_has_init > 0)
                 jax.lax.cond(should_load_t, load_t_state, lambda: None)
 
-                # Cold-start: zero the slot in place for a new sequence with
-                # no carried-over state. Mutually exclusive with load_t_state.
-                @pl.when((t_is_first > 0) & (t_has_init == 0))
-                def _zero_t_slot():
-                    prefill_scratch[t_slot] = jnp.zeros(
-                        (n_v, d_k, d_v), dtype=prefill_scratch.dtype)
+                h0_new = prefill_scratch[0]
+                h1_new = prefill_scratch[1]
+                new_h = jnp.where(t_slot == 0, h0_new, h1_new)
 
-                h = prefill_scratch[t_slot]
+                new_h = jnp.where((t_is_first > 0) & (t_has_init == 0),
+                                  jnp.zeros_like(new_h), new_h)
+                h = new_h
 
                 current_r = t_req
 
@@ -794,16 +796,15 @@ def inner_kernel(
 
             final_slot = current_r % 2
             prefill_scratch[final_slot] = h
+            state_commit_scratch[0] = h.astype(state_commit_scratch.dtype)
 
             is_current_r_prefill = current_r >= decode_tokens
 
-            # Store state if the current request is a prefill.
-            # At the end of the transition prefill. No need to make this async.
+            # Store state if the current request is a prefill
             @pl.when(is_current_r_prefill)
             def do_final_write():
+                # TODO: make async
                 state_idx = state_indices[current_r][...]
-                # Stage h into state_commit only when we actually DMA out.
-                state_commit_scratch[0] = h.astype(state_commit_scratch.dtype)
                 copy_op = pltpu.make_async_copy(
                     src_ref=state_commit_scratch,
                     dst_ref=recurrent_state_out.at[pl.ds(state_idx, 1)],
