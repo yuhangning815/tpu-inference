@@ -1278,7 +1278,7 @@ def recurrent_scan(
 
     # Default the scoped VMEM ceiling. This value could be tuned for different state cache numerics and chunk sizes.
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = tpu_info.vmem_capacity_bytes
+        vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.8)
 
     # Pad token dimension so invalid pipeline steps DMA into a safe sink area.
     # Sink offset must be aligned to sublanesize for Mosaic tile compatibility.
