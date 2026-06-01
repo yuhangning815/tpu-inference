@@ -21,6 +21,11 @@ import jax.numpy as jnp
 
 from tpu_inference.kernels.gdn.v2 import \
     compute_schedule_v2 as compute_schedule_table_v2
+from tpu_inference.logger import init_logger
+
+# [GDN-DEBUG] branch ningdaniel-gdn-debug-dtype-vmem
+logger = init_logger(__name__)
+_GDN_DEBUG_LOGGED = set()
 
 
 # def invert_triangular_matrix(A, block_size=None):
@@ -1277,6 +1282,53 @@ def recurrent_scan(
     num_tokens = mixed_qkv.shape[0]
     tpu_info = pltpu.get_tpu_info()
     sublanesize = 4 // mixed_qkv.itemsize * tpu_info.num_sublanes
+
+    # ─────────────────────────── [GDN-DEBUG] ───────────────────────────
+    # VMEM footprint accounting (branch ningdaniel-gdn-debug-dtype-vmem).
+    # The hand-allocated scratch in `pl.run_scoped` scales with
+    # `recurrent_state.dtype`: decode_state(1x) + decode_load(2x) +
+    # decode_store(2x) = 5 units of (n_v, d_k, d_v). If the state is fp32
+    # instead of bf16 these double, which (with vmem_limit_bytes=0.8*cap)
+    # is the suspected trigger for the quality regression. This logs the
+    # estimate vs the 0.8*capacity ceiling, plus the counterfactual at the
+    # other dtype. Estimate only (Mosaic adds its own overhead).
+    _state_isz = recurrent_state.itemsize
+    _qkv_isz = mixed_qkv.itemsize
+    _a_isz = a.itemsize
+    _b_isz = b.itemsize
+    _d = mixed_qkv.shape[-1]
+    _unit = n_v * d_k * d_v  # elements in one (n_v, d_k, d_v) buffer
+    _scratch = (
+        2 * _unit * 4  # prefill_scratch (always f32)
+        + 1 * _unit * _state_isz  # decode_state_scratch
+        + 2 * _unit * _state_isz  # decode_load_scratch (double-buffered)
+        + 2 * _unit * _state_isz  # decode_store_scratch (double-buffered)
+        + BT * (n_v * d_v) * _qkv_isz)  # decode_output_scratch
+    # emit_pipeline double-buffers each in/out BlockSpec (factor 2)
+    _pipe = 2 * (chunk_size * _d * _qkv_isz + BT * _d * _qkv_isz +
+                 chunk_size * 128 * _a_isz + BT * 128 * _a_isz +
+                 chunk_size * 128 * _b_isz + BT * 128 * _b_isz +
+                 chunk_size * (n_v * d_v) * _qkv_isz + BT *
+                 (n_v * d_v) * _qkv_isz)
+    _other_isz = 4 if _state_isz == 2 else 2
+    _scratch_other = (2 * _unit * 4 + (1 + 2 + 2) * _unit * _other_isz +
+                      BT * (n_v * d_v) * _qkv_isz)
+    _cap = tpu_info.vmem_capacity_bytes
+    _key = (str(recurrent_state.dtype), n_kq, n_v, d_k, d_v, chunk_size, BT)
+    if _key not in _GDN_DEBUG_LOGGED:
+        _GDN_DEBUG_LOGGED.add(_key)
+        _MB = 1.0 / (1024 * 1024)
+        logger.info(
+            "[GDN-DEBUG] recurrent_scan VMEM: state_dtype=%s(itemsize=%d) "
+            "n_kq=%d n_v=%d d_k=%d d_v=%d C=%d BT=%d d=%d || "
+            "scratch=%.2fMB pipeline~=%.2fMB est_total~=%.2fMB || "
+            "vmem_capacity=%.2fMB  0.8*cap=%.2fMB  est_total/0.8cap=%.0f%% || "
+            "scratch_if_state_were_%dB=%.2fMB", str(recurrent_state.dtype),
+            _state_isz, n_kq, n_v, d_k, d_v, chunk_size, BT, _d, _scratch * _MB,
+            _pipe * _MB, (_scratch + _pipe) * _MB, _cap * _MB, 0.8 * _cap * _MB,
+            100.0 * (_scratch + _pipe) / (0.8 * _cap), _other_isz,
+            _scratch_other * _MB)
+    # ────────────────────────────────────────────────────────────────────
 
     # Default the scoped VMEM ceiling. This value could be tuned for different state cache numerics and chunk sizes. 
     # if vmem_limit_bytes is None:

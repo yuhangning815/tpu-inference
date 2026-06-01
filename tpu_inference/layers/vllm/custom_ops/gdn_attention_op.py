@@ -120,6 +120,28 @@ def gdn_attention_core_tpu(
     #     the slot that holds this request's real state.
     state_indices = attn_metadata.mamba_state_indices.astype(jnp.int32)
 
+    # ─────────────────────────── [GDN-DEBUG] ───────────────────────────
+    # Temporary instrumentation (branch ningdaniel-gdn-debug-dtype-vmem).
+    # Ground truth for whether `--mamba-ssm-cache-dtype=bfloat16` is still
+    # honored after #2663 removed the TPU override: the *actual* allocated
+    # recurrent_state (mamba SSM cache) dtype. Also logs what vLLM resolved
+    # the flag to, and the TP/DP sizes (per-rank n_v = n_v // tp_size).
+    try:
+        from vllm.config import get_current_vllm_config
+        _cc = get_current_vllm_config().cache_config
+        _cfg_mamba_dtype = getattr(_cc, "mamba_ssm_cache_dtype", "<no attr>")
+    except Exception as _e:  # best effort; never break the eval
+        _cfg_mamba_dtype = f"<unavailable: {type(_e).__name__}: {_e}>"
+    logger.info_once(
+        f"[GDN-DEBUG] recurrent_state.dtype={recurrent_state.dtype} "
+        f"recurrent_state.shape={tuple(recurrent_state.shape)} "
+        f"conv_state.dtype={conv_state.dtype} "
+        f"n_v={n_v} tp_size={tp_size} dp_size={dp_size} "
+        f"per_rank_n_v={n_v // tp_size if tp_size else n_v} "
+        f"padded_num_reqs={attn_metadata.padded_num_reqs} "
+        f"cache_config.mamba_ssm_cache_dtype={_cfg_mamba_dtype}")
+    # ────────────────────────────────────────────────────────────────────
+
     config = GdnAttentionConfig(
         ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
             envs.RAGGED_GATED_DELTA_RULE_IMPL))
