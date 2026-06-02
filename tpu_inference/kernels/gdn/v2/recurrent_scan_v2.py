@@ -1278,8 +1278,10 @@ def recurrent_scan(
     sublanesize = 4 // mixed_qkv.itemsize * tpu_info.num_sublanes
 
     # Default the scoped VMEM ceiling. This value could be tuned for different state cache numerics and chunk sizes.
+    # [TEST] Reproduce the failing 0.8*capacity budget so we can check whether
+    # the optimization_barrier below fixes the corruption at this budget.
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = tpu_info.vmem_capacity_bytes
+        vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.8)
 
     # Pad token dimension so invalid pipeline steps DMA into a safe sink area.
     # Sink offset must be aligned to sublanesize for Mosaic tile compatibility.
@@ -1287,6 +1289,15 @@ def recurrent_scan(
     sink_offset = ((num_tokens + sublanesize - 1) // sublanesize) * sublanesize
     pad_rows = sink_offset + block_size - num_tokens
     mixed_qkv = jnp.pad(mixed_qkv, ((0, pad_rows), (0, 0)))
+    # [TEST] Force mixed_qkv into its own materialized buffer before the
+    # pallas_call. From the HLO, mixed_qkv is the only operand whose memory
+    # space flips (S(1) -> S(0)) at vmem=0.8, and at 0.8 it shares the default
+    # space with the kernel outputs. If the corruption is XLA reusing/overlapping
+    # mixed_qkv's buffer with an output under memory pressure, pinning it as a
+    # distinct value here should fix it. If it does NOT fix it, the bug is in the
+    # emit_pipeline auto-DMA-from-S(0) path, which would justify a manual
+    # make_async_copy rewrite for mixed_qkv.
+    mixed_qkv = jax.lax.optimization_barrier(mixed_qkv)
 
     # Pad raw a and b to (num_tokens + pad_rows, 128) for sublanes
     a_padded = jnp.pad(a, ((0, pad_rows), (0, 128 - n_v)))
