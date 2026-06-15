@@ -627,17 +627,25 @@ class PrefillProcessor(ScanProcessor):
 
             decay = exp_g_chunk_T[:, i][..., None]
 
+            # Defensive code to handle NaNs and infs in state, which can happen
+            # due to large decay or long sequences. Mirrors the guards in the
+            # decode path: reset the stale-state contribution to zero and rely
+            # solely on the new value.
+            # TODO: analyze perf impact and risk of removing this.
             k_state = jnp.sum(k_i[..., None] * h, axis=1)
-            v_diff = v_i - decay * k_state
+            decay_k_state = jnp.where(jnp.isinf(k_state), 0.0, decay * k_state)
+            v_diff = v_i - decay_k_state
             v_new = beta_i[:, None] * v_diff
 
             q_state = jnp.sum(q_i[..., None] * h, axis=1)
             q_k = jnp.sum(q_i * k_i, axis=-1, keepdims=True)
 
-            out_i = decay * q_state + q_k * v_new
+            decay_q_state = jnp.where(jnp.isinf(q_state), 0.0, decay * q_state)
+            out_i = decay_q_state + q_k * v_new
 
             k_v_new = k_i[..., None] * v_new[:, None, :]
-            h_new = h * decay[..., None] + k_v_new
+            decay_state = jnp.where(jnp.isinf(h), 0.0, h * decay[..., None])
+            h_new = decay_state + k_v_new
 
             h = jnp.where(sequence_valid, h_new, h)
             out_i = jnp.where(sequence_valid, out_i, 0.0)
