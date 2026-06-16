@@ -656,6 +656,13 @@ def inner_kernel(
                 current_state.astype(jnp.float32),
                 precision=jax.lax.Precision.HIGHEST,
             )  # (n_v, 2C, d_v)
+            # Defensive code to handle infs in state, which can happen due to
+            # large decay or long sequences. Mirrors the decode-path guards:
+            # reset the stale-state contribution to zero and rely solely on the
+            # new value. comb = qw @ state, so this covers both attn_inter
+            # (q @ state) and v_prime (w @ state).
+            # TODO: analyze perf impact and risk of removing this.
+            comb = jnp.where(jnp.isinf(comb), 0.0, comb)
             attn_inter = comb[:, :C, :]
             v_prime = comb[:, C:, :]
 
@@ -673,7 +680,12 @@ def inner_kernel(
                 v_new,
                 precision=jax.lax.Precision.HIGHEST,
             )
-            h_new = current_state * g_i_last_exp + update_term
+            # Defensive: reset the stale-state decay term to zero on inf
+            # (mirrors decode). Also avoids inf * 0 -> NaN when g_i_last_exp
+            # underflows to 0 for long sequences.
+            decay_state = jnp.where(jnp.isinf(current_state), 0.0,
+                                    current_state * g_i_last_exp)
+            h_new = decay_state + update_term
 
             prefill_scratch[prefill_slot] = h_new.astype(prefill_scratch.dtype)
 
@@ -872,17 +884,27 @@ def inner_kernel(
 
                 decay = jnp.exp(g_i)[..., None]
 
+                # Defensive code to handle infs in state, which can happen due
+                # to large decay or long sequences. Mirrors the decode-path
+                # guards: reset the stale-state contribution to zero and rely
+                # solely on the new value.
+                # TODO: analyze perf impact and risk of removing this.
                 k_state = jnp.sum(k_i[..., None] * h, axis=1)
-                v_diff = v_i - decay * k_state
+                decay_k_state = jnp.where(jnp.isinf(k_state), 0.0,
+                                          decay * k_state)
+                v_diff = v_i - decay_k_state
                 v_new = beta_i[:, None] * v_diff
 
                 q_state = jnp.sum(q_i[..., None] * h, axis=1)
                 q_k = jnp.sum(q_i * k_i, axis=-1, keepdims=True)
 
-                out_i = decay * q_state + q_k * v_new
+                decay_q_state = jnp.where(jnp.isinf(q_state), 0.0,
+                                          decay * q_state)
+                out_i = decay_q_state + q_k * v_new
 
                 k_v_new = k_i[..., None] * v_new[:, None, :]
-                h_new = h * decay[..., None] + k_v_new
+                decay_state = jnp.where(jnp.isinf(h), 0.0, h * decay[..., None])
+                h_new = decay_state + k_v_new
 
                 h = jnp.where(sequence_valid, h_new, h)
 
