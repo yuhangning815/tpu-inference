@@ -363,6 +363,12 @@ def _decode_kernel_main(
                     (((2, ), (1, )), ((0, ), (0, ))),
                     preferred_element_type=jnp.float32,
                 ).reshape(H_v, V)
+                # Defensive: reset stale-state contribution to zero on inf,
+                # mirroring recurrent_scan_v2.process_decode. In bf16 the
+                # recurrent state can blow up to inf over long decodes; without
+                # this the inf leaks into the output/state -> NaN downstream.
+                # No-op in fp32 (no inf), so it cannot regress the fp32 path.
+                kh = jnp.where(jnp.isinf(kh), 0.0, kh)
 
                 v_diff = v_t - kh
                 if b_ref is not None:
@@ -377,10 +383,14 @@ def _decode_kernel_main(
                     (((2, ), (1, )), ((0, ), (0, ))),
                     preferred_element_type=jnp.float32,
                 ).reshape(H_v, V)
+                o_step1 = jnp.where(jnp.isinf(o_step1), 0.0, o_step1)
 
                 o_t = o_step1 + qk_dot * b_v
-                h_new = h0 * exp_gk[:, :, None] + k_t[:, :,
-                                                      None] * b_v[:, None, :]
+                # Defensive: reset stale-state decay term to zero on inf
+                # (mirrors recurrent_scan_v2.process_decode). No-op in fp32.
+                decay_state = jnp.where(jnp.isinf(h0), 0.0,
+                                        h0 * exp_gk[:, :, None])
+                h_new = decay_state + k_t[:, :, None] * b_v[:, None, :]
 
                 o_ref[i_t] = o_t.astype(o_ref.dtype)
                 h_bufs_s[buf_idx, i_t] = h_new.astype(h_bufs_s.dtype)
